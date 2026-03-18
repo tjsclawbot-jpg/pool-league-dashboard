@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { io } from 'socket.io-client';
 import MatchManagement from './components/MatchManagement';
 import TournamentList from './components/TournamentList';
 import './styles/App.css';
@@ -8,83 +7,47 @@ const App = () => {
   const [tournaments, setTournaments] = useState([]);
   const [selectedTournament, setSelectedTournament] = useState(null);
   const [apiStatus, setApiStatus] = useState('disconnected');
-  const [socket, setSocket] = useState(null);
 
   const API_URL = process.env.REACT_APP_API_URL || 'https://pool-league-api-production.up.railway.app';
 
-  useEffect(() => {
-    // Initialize Socket.io connection (with timeout to prevent blocking)
-    const newSocket = io(API_URL, {
-      reconnection: true,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      reconnectionAttempts: 3,
-      timeout: 3000, // 3 second timeout
-      transports: ['websocket', 'polling'], // Fallback to polling if WebSocket fails
-    });
-
-    newSocket.on('connect', () => {
-      console.log('🔌 Socket connected:', newSocket.id);
+  // Fetch tournaments from API
+  const fetchTournamentsFromAPI = async () => {
+    console.log('🔄 Fetching tournaments from:', `${API_URL}/api/tournaments`);
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      
+      const response = await fetch(`${API_URL}/api/tournaments`, {
+        signal: controller.signal,
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      console.log('✅ Tournaments fetched:', data.length, 'tournaments');
+      setTournaments(data);
       setApiStatus('connected');
-    });
+    } catch (error) {
+      console.error('❌ Error fetching tournaments:', error.message || error);
+      setApiStatus('connected'); // Still show the page even on error
+      setTournaments([]); // Show empty list instead of loading forever
+    }
+  };
 
-    newSocket.on('disconnect', () => {
-      console.log('🔌 Socket disconnected');
-      setApiStatus('disconnected');
-    });
-
-    newSocket.on('connect_error', (error) => {
-      console.log('⚠️ Socket connection error (will use HTTP polling):', error);
-      setApiStatus('connected'); // Still allow display with HTTP polling
-    });
-
-    newSocket.on('tournament:created', (data) => {
-      setTournaments(prev => [data, ...prev]);
-    });
-
-    newSocket.on('tournament:updated', (data) => {
-      setTournaments(prev =>
-        prev.map(t => (t.id === data.id ? data : t))
-      );
-    });
-
-    setSocket(newSocket);
-
-    return () => {
-      newSocket.close();
-    };
+  // Fetch on mount
+  useEffect(() => {
+    fetchTournamentsFromAPI();
   }, [API_URL]);
 
-  // Fetch tournaments on mount
+  // Poll for tournaments every 5 seconds
   useEffect(() => {
-    const fetchTournaments = async () => {
-      console.log('🔄 Fetching tournaments from:', `${API_URL}/api/tournaments`);
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-        
-        const response = await fetch(`${API_URL}/api/tournaments`, {
-          signal: controller.signal,
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        const data = await response.json();
-        console.log('✅ Tournaments fetched:', data.length, 'tournaments');
-        setTournaments(data);
-        setApiStatus('connected');
-      } catch (error) {
-        console.error('❌ Error fetching tournaments:', error.message || error);
-        setApiStatus('connected'); // Still show the page even on error
-        setTournaments([]); // Show empty list instead of loading forever
-      }
-    };
-
-    fetchTournaments();
+    console.log('📡 Starting HTTP polling for tournament updates...');
+    const pollInterval = setInterval(fetchTournamentsFromAPI, 5000);
+    return () => clearInterval(pollInterval);
   }, [API_URL]);
 
   return (
@@ -108,14 +71,12 @@ const App = () => {
             tournaments={tournaments}
             onSelect={setSelectedTournament}
             apiUrl={API_URL}
-            socket={socket}
           />
         ) : (
           <MatchManagement
             tournament={selectedTournament}
             onBack={() => setSelectedTournament(null)}
             apiUrl={API_URL}
-            socket={socket}
           />
         )}
       </main>
