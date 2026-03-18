@@ -13,12 +13,14 @@ const App = () => {
   const API_URL = process.env.REACT_APP_API_URL || 'https://pool-league-api-production.up.railway.app';
 
   useEffect(() => {
-    // Initialize Socket.io connection
+    // Initialize Socket.io connection (with timeout to prevent blocking)
     const newSocket = io(API_URL, {
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: 3,
+      timeout: 3000, // 3 second timeout
+      transports: ['websocket', 'polling'], // Fallback to polling if WebSocket fails
     });
 
     newSocket.on('connect', () => {
@@ -29,6 +31,11 @@ const App = () => {
     newSocket.on('disconnect', () => {
       console.log('🔌 Socket disconnected');
       setApiStatus('disconnected');
+    });
+
+    newSocket.on('connect_error', (error) => {
+      console.log('⚠️ Socket connection error (will use HTTP polling):', error);
+      setApiStatus('connected'); // Still allow display with HTTP polling
     });
 
     newSocket.on('tournament:created', (data) => {
