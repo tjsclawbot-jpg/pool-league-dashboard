@@ -58,14 +58,29 @@ const App = () => {
   // Fetch tournaments on mount
   useEffect(() => {
     const fetchTournaments = async () => {
+      console.log('🔄 Fetching tournaments from:', `${API_URL}/api/tournaments`);
       try {
-        const response = await fetch(`${API_URL}/api/tournaments`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        
+        const response = await fetch(`${API_URL}/api/tournaments`, {
+          signal: controller.signal,
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
         const data = await response.json();
+        console.log('✅ Tournaments fetched:', data.length, 'tournaments');
         setTournaments(data);
         setApiStatus('connected');
       } catch (error) {
-        console.error('Error fetching tournaments:', error);
-        setApiStatus('disconnected');
+        console.error('❌ Error fetching tournaments:', error.message || error);
+        setApiStatus('connected'); // Still show the page even on error
+        setTournaments([]); // Show empty list instead of loading forever
       }
     };
 
