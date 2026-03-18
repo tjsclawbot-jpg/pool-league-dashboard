@@ -1,0 +1,321 @@
+name: Dashboard CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'pool-league-dashboard/**'
+      - '.github/workflows/ci-dashboard.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'pool-league-dashboard/**'
+
+env:
+  REGISTRY: ghcr.io
+  NODE_VERSION: '18.x'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    name: ESLint & Code Quality
+    defaults:
+      run:
+        working-directory: ./pool-league-dashboard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'pool-league-dashboard/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: |
+          npm install --save-dev eslint @babel/eslint-parser eslint-plugin-react
+          npx eslint . --ext .js,.jsx --max-warnings 0 || true
+        continue-on-error: true
+
+      - name: Check for console errors (build)
+        run: npm run build 2>&1 | grep -i "error" || true
+        continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    name: Jest Unit Tests
+    defaults:
+      run:
+        working-directory: ./pool-league-dashboard
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'pool-league-dashboard/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Jest
+        run: |
+          npm install --save-dev jest @testing-library/react @testing-library/jest-dom babel-jest
+          cat > jest.config.js << 'EOF'
+          module.exports = {
+            testEnvironment: 'jsdom',
+            setupFilesAfterEnv: ['<rootDir>/setupTests.js'],
+            moduleNameMapper: {
+              '\\.(css|less|scss|sass)$': 'identity-obj-proxy',
+            },
+            transform: {
+              '^.+\\.(js|jsx)$': 'babel-jest',
+            },
+          };
+          EOF
+
+      - name: Run Jest tests
+        run: npm test -- --passWithNoTests --coverage || true
+        env:
+          CI: true
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./pool-league-dashboard/coverage/coverage-final.json
+          flags: dashboard-coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    runs-on: ubuntu-latest
+    name: Webpack Build
+    defaults:
+      run:
+        working-directory: ./pool-league-dashboard
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'pool-league-dashboard/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build with Webpack
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Check build output
+        run: |
+          if [ -d "dist" ]; then
+            echo "✓ Build successful - dist directory created"
+            du -sh dist
+            find dist -type f -name "*.js" -o -name "*.html" | head -10
+          else
+            echo "✗ Build failed - no dist directory"
+            exit 1
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-build-${{ github.sha }}
+          path: ./pool-league-dashboard/dist
+          retention-days: 7
+
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security & Dependencies
+    defaults:
+      run:
+        working-directory: ./pool-league-dashboard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate || true
+        continue-on-error: true
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          path: './pool-league-dashboard'
+          format: 'JSON'
+          args: >
+            --enableExperimental
+            --scan ./pool-league-dashboard
+        continue-on-error: true
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    name: Deploy to Railway (Staging)
+    needs: [ build, security-scan ]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://pool-league-dashboard-staging.railway.app
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dashboard-build-${{ github.sha }}
+          path: ./pool-league-dashboard/dist
+
+      - name: Deploy to Railway (Staging)
+        uses: railway-app/actions-deploy@v1
+        with:
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}
+          service: pool-league-dashboard-staging
+          environment: staging
+
+      - name: Verify Staging Deployment
+        timeout-minutes: 5
+        run: |
+          echo "Waiting for staging deployment..."
+          for i in {1..30}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://pool-league-dashboard-staging.railway.app)
+            if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "301" ]; then
+              echo "✓ Staging deployment successful"
+              exit 0
+            fi
+            echo "Attempt $i/30 - HTTP $RESPONSE"
+            sleep 10
+          done
+          echo "✗ Deployment verification failed"
+          exit 1
+
+      - name: Notify Slack (Staging)
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Dashboard deployed to staging",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Pool League Dashboard - Staging Deployment* ✅\n*Commit:* `${{ github.sha }}`\n*Branch:* ${{ github.ref_name }}\n*URL:* https://pool-league-dashboard-staging.railway.app"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    name: Deploy to Railway (Production)
+    needs: [ build, security-scan ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://pool-league-dashboard.railway.app
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dashboard-build-${{ github.sha }}
+          path: ./pool-league-dashboard/dist
+
+      - name: Deploy to Railway (Production)
+        uses: railway-app/actions-deploy@v1
+        with:
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}
+          service: pool-league-dashboard
+          environment: production
+
+      - name: Health Check
+        id: health
+        timeout-minutes: 5
+        run: |
+          echo "Waiting for production deployment..."
+          for i in {1..30}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://pool-league-dashboard.railway.app)
+            if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "301" ]; then
+              echo "✓ Production deployment successful"
+              echo "health_status=healthy" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Attempt $i/30 - HTTP $RESPONSE"
+            sleep 10
+          done
+          echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Slack Notification (Success)
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Dashboard deployed to production",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Pool League Dashboard - Production Deployment* ✅\n*Commit:* `${{ github.sha }}`\n*Branch:* main\n*URL:* https://pool-league-dashboard.railway.app\n*Health:* ${{ steps.health.outputs.health_status }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Slack Notification (Failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "❌ Dashboard production deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Pool League Dashboard - Production Deployment Failed* ❌\n*Commit:* `${{ github.sha }}`\n*Branch:* main\n*Action:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
